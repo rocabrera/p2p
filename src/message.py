@@ -1,8 +1,6 @@
 import json
 
-
 class Message:
-
 
     def __init__(self, content, msg_type, sender, extra_info=None):
         self.content = content
