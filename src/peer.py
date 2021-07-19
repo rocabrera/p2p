@@ -44,6 +44,7 @@ class Peer:
         self.UDPAliveClientSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.UDPAliveClientSocket.bind((self.PEER_ADRESS, 0))  # Delega pegar uma porta ao SO
         self.UDP_ALIVE_PORT = self.UDPAliveClientSocket.getsockname()[1]
+
         # Define o peer
         self.PEER = (self.PEER_ADRESS, (self.TCP_PORT, self.UDP_PORT, self.UDP_ALIVE_PORT))
 
@@ -98,6 +99,9 @@ class Peer:
         sender_socket.close()
 
     def _listen_alive(self):
+        """
+        Responsável por ficar ouvindo até receber uma requisição ALIVE do servidor.
+        """
         while True:
             data, _ = self.UDPAliveClientSocket.recvfrom(self.BUFFERSIZE)
             recv_msg = json.loads(data.decode('utf-8'))  # Transforma json em dict
@@ -135,6 +139,9 @@ class Peer:
                 self.qtd_try = 0
 
     def _handle_request(self, recv_msg):
+        """
+        Recebe as respostas do servidor e faz o dispatch com as informações necessárias para a função correta.
+        """
 
         msg_type = recv_msg["msg_type"]  # Tipo de requisição
         content = recv_msg["content"]  # Conteúdo da requisição
@@ -160,6 +167,9 @@ class Peer:
         print(f"Sou o peer [{self.PEER_ADRESS}]:[{self.TCP_PORT}] com arquivos {self.files}\n")
 
     def _handle_update(self):
+        """
+        Espera pela requisição UPDATE_OK.
+        """
         pass
         #print("Informações atualizadas com sucesso.")
 
@@ -172,12 +182,12 @@ class Peer:
         parse_msg = content.strip('[]').split()  # Parse do conteúdo da mensagem
         for peer_str in parse_msg:
             address, port = peer_str.split(':')  # Parse do peer no formato string
-            self.network_peers[(address, int(port))] = filename  # Adiciona o peer na rede se não existir e o arquivo especificado
+            self.network_peers[(address, int(port))] = filename  # Adiciona o peer na rede e o arquivo especificado
         print(f"Peers com arquivo solicitado: {content}")
 
     def _handle_leave(self):
         """
-        Desliga o peer.
+        Termina execução do arquivo.
         """
         os._exit(os.EX_OK)
 
@@ -191,26 +201,34 @@ class Peer:
 
             command, *msg = request.split()
             command = command.upper()
-            if command != "DOWNLOAD":
+
+            if command != "DOWNLOAD": # Timeout é somente para a comunicação com o servidor.
                 self.UDPClientSocket.settimeout(self.REQUEST_TIMEOUT)  # Start o timeout somente após saber qual requisição será pedida.
             self.pipeline_request(command, msg)
-            self.UDPClientSocket.settimeout(None)  # Zera timeout para o socket
+            self.UDPClientSocket.settimeout(None)  # Zera timeout para o socket.
 
     def pipeline_request(self, command, msg):
+        """
+        Inicializa duas threads, uma que faz o dispatch da mensagem para a função correta 
+        e outra que prepara o peer para receber uma resposta UDP caso seja necessário.
+        """
         
-            receive_thread = threading.Thread(target=self._receive, args=(command, msg))  # Espera resposta para a requisição 
-            request_thread = threading.Thread(target=self._dispatch_request, args=(command, msg))  # Faz o dispatch da requisição.
+        receive_thread = threading.Thread(target=self._receive, args=(command, msg))  # Espera resposta para a requisição.
+        request_thread = threading.Thread(target=self._dispatch_request, args=(command, msg))  # Faz o dispatch da requisição.
 
-            request_thread.start()
-            receive_thread.start()
-            
-            if command != "DOWNLOAD":
-                receive_thread.join()
+        request_thread.start()
+        receive_thread.start()
+        
+        if command != "DOWNLOAD": # Necessário porque no caso da download é comunicação entre peers.
+            receive_thread.join()
 
-            request_thread.join()
+        request_thread.join()
 
 
     def _dispatch_request(self, command, msg):
+        """
+        Redireciona a mensagem com as informações necessárias para a função correta. 
+        """
 
         if command == "JOIN":
             self.join()
@@ -255,44 +273,48 @@ class Peer:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 try:
                     s.connect(peer)
+
+                    msg = Message(content=requested_file, msg_type="DOWNLOAD", sender=self.PEER)
+                    print(f"Pedindo arquivo para o Peer [{peer[0]}]:[{peer[1]}]")
+                    s.send(msg.to_json("utf-8"))
+
+                    # Recebe via TCP do outro peer se o download foi aceito e tamanho do arquivo solicitado
+                    info_downlaod = s.recv(self.BUFFERSIZE).decode("utf-8")
+                    answer_download = json.loads(info_downlaod)
+                    msg_type = answer_download["msg_type"]
+                    time.sleep(0.1)
+                    if msg_type == "DOWNLOAD_ACEITO":
+                        filesize = int(answer_download["extra_info"])
+                        #with tqdm(range(filesize), f"Receiving {requested_file}", unit="B", unit_scale=True, unit_divisor=1024) as progress_bar:
+                        with open(new_file_path, "wb") as f: # abre o arquivo no modo binário.
+                            while True:
+                                bytes_read = s.recv(self.BUFFERSIZE) # Recebe chunk de dados.
+                                if not bytes_read: # indica se terminou o download.
+                                    break
+                                f.write(bytes_read)
+                        #            progress_bar.update(len(bytes_read))
+
+                        print(f"Arquivo {requested_file} baixado com sucesso na pasta {self.file_folder_path}")
+
+                        # Solicita o update do peer ao servidor
+                        msg = Message(content=requested_file, msg_type="UPDATE", sender=self.PEER)
+                        self.UDPClientSocket.sendto(msg.to_json("utf-8"), self.SERVER)
+
+                        return None
+
+                    elif msg_type == "DOWNLOAD_NEGADO":
+                        print(f"Peer [{peer[0]}]:[{peer[1]}] negou o download.")
+
                 except ConnectionRefusedError:
-                    print("Peer não está disponível")
+                    #print("Peer não está disponível")
                     return None
                 finally:
-                    s.close
-                msg = Message(content=requested_file, msg_type="DOWNLOAD", sender=self.PEER)
-                print(f"Pedindo arquivo para o Peer [{peer[0]}]:[{peer[1]}]")
-                s.send(msg.to_json("utf-8"))
-
-                # Recebe via TCP do outro peer se o download foi aceito e tamanho do arquivo solicitado
-                info_downlaod = s.recv(self.BUFFERSIZE).decode("utf-8")
-                answer_download = json.loads(info_downlaod)
-                msg_type = answer_download["msg_type"]
-                time.sleep(0.1)
-                if msg_type == "DOWNLOAD_ACEITO":
-                    filesize = int(answer_download["extra_info"])
-                    #with tqdm(range(filesize), f"Receiving {requested_file}", unit="B", unit_scale=True, unit_divisor=1024) as progress_bar:
-                    with open(new_file_path, "wb") as f:
-                        while True:
-                            bytes_read = s.recv(self.BUFFERSIZE)
-                            if not bytes_read:
-                                break
-                            f.write(bytes_read)
-                    #            progress_bar.update(len(bytes_read))
-
-                    print(f"Arquivo {requested_file} baixado com sucesso na pasta {self.file_folder_path}")
-
-                    msg = Message(content=requested_file, msg_type="UPDATE", sender=self.PEER)
-                    self.UDPClientSocket.sendto(msg.to_json("utf-8"), self.SERVER)
-
-                    return None
-
-                elif msg_type == "DOWNLOAD_NEGADO":
-                    print(f"Peer [{peer[0]}]:[{peer[1]}] negou o download.")
-
-                s.close()
+                    s.close()
 
     def wrong_msg(self):
+        """
+        Envia uma mensagem erro ao servidor.
+        """
         msg = Message(content="", msg_type="UNKNOWN", sender=self.PEER)
         self.UDPClientSocket.sendto(msg.to_json("utf-8"), self.SERVER)
 
